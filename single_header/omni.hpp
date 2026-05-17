@@ -3376,8 +3376,9 @@ namespace omni {
     using is_always_equal = std::true_type;
 
    private:
-    static void* virtual_alloc(void* address, std::uint64_t allocation_size, std::uint32_t alloc_type, std::uint32_t protect) {
+    static void* virtual_alloc(void* address, std::size_t allocation_size, std::uint32_t alloc_type, std::uint32_t protect) {
       void* current_process{reinterpret_cast<void*>(-1)};
+      omni::address::value_type zero_bits{};
 
       auto nt_allocate_mem = omni::address{detail::cached_alloc_proc.load(std::memory_order_acquire)};
       if (!nt_allocate_mem) {
@@ -3394,14 +3395,14 @@ namespace omni {
 
       auto result = nt_allocate_mem.template invoke<omni::status>(current_process,
         &address,
-        0ULL,
+        zero_bits,
         &allocation_size,
         allocation_type,
         protect);
       return result.has_value() && result->is_success() ? address : nullptr;
     }
 
-    static bool virtual_free(void* address, std::uint64_t size, std::uint32_t free_type) {
+    static bool virtual_free(void* address, std::size_t size, std::uint32_t free_type) {
       void* current_process{reinterpret_cast<void*>(-1)};
 
       auto nt_free_mem = omni::address{detail::cached_free_proc.load(std::memory_order_acquire)};
@@ -4140,13 +4141,20 @@ namespace omni {
 
 } // namespace omni
 
+#include <atomic>
 #include <expected>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 
 #include <array>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
 namespace omni::detail {
 
@@ -4158,25 +4166,29 @@ namespace omni::detail {
     explicit shellcode(storage_type shellcode) noexcept: shellcode_(shellcode) {}
 
     shellcode(const shellcode&) = delete;
-    shellcode(shellcode&&) = default;
+    shellcode(shellcode&& other) noexcept
+      : memory_(std::exchange(other.memory_, nullptr)), allocator_(other.allocator_), shellcode_(std::move(other.shellcode_)) {}
     shellcode& operator=(const shellcode&) = delete;
-    shellcode& operator=(shellcode&&) = default;
-
-    ~shellcode() {
-      if (memory_ == nullptr) {
-        return;
+    shellcode& operator=(shellcode&& other) noexcept {
+      if (this == std::addressof(other)) {
+        return *this;
       }
 
-      allocator_.deallocate(memory_, Size);
-      memory_ = nullptr;
+      reset();
+      allocator_ = other.allocator_;
+      shellcode_ = std::move(other.shellcode_);
+      memory_ = std::exchange(other.memory_, nullptr);
+      return *this;
+    }
+
+    ~shellcode() noexcept {
+      reset();
     }
 
     void setup() {
+      reset();
       memory_ = allocator_.allocate(Size);
-      if (memory_ != nullptr) {
-        std::memcpy(memory_, shellcode_.data(), Size);
-        shellcode_fn_ = memory_;
-      }
+      std::memcpy(memory_, shellcode_.data(), Size);
     }
 
     template <std::integral T = std::uint8_t>
@@ -4192,28 +4204,36 @@ namespace omni::detail {
     template <typename T, typename... Args>
       requires(std::is_default_constructible_v<T>)
     [[nodiscard]] T execute(Args&&... args) const noexcept {
-      if (!shellcode_fn_) {
+      if (!memory_) {
         return T{};
       }
-      return reinterpret_cast<T(__stdcall*)(Args...)>(shellcode_fn_)(args...);
+      return reinterpret_cast<T(__stdcall*)(Args...)>(memory_)(args...);
     }
 
     template <typename T = void, typename... Args>
       requires(std::is_void_v<T>)
     [[nodiscard]] T execute(Args&&... args) const noexcept {
-      if (!shellcode_fn_) {
+      if (!memory_) {
         return;
       }
-      reinterpret_cast<void(__stdcall*)(Args...)>(shellcode_fn_)(args...);
+      reinterpret_cast<void(__stdcall*)(Args...)>(memory_)(args...);
     }
 
     template <typename T = void, typename PointerT = std::add_pointer_t<T>>
     [[nodiscard]] PointerT ptr() const noexcept {
-      return static_cast<PointerT>(shellcode_fn_);
+      return static_cast<PointerT>(memory_);
     }
 
    private:
-    void* shellcode_fn_{nullptr};
+    void reset() noexcept {
+      if (memory_ == nullptr) {
+        return;
+      }
+
+      allocator_.deallocate(memory_, Size);
+      memory_ = nullptr;
+    }
+
     std::uint8_t* memory_{nullptr};
     rwx_allocator<std::uint8_t> allocator_;
     std::array<std::uint8_t, Size> shellcode_{};
@@ -4690,21 +4710,81 @@ namespace omni {
   static_assert(concepts::syscall_id_parser<default_syscall_id_parser>);
 
   struct shellcode_syscall_invoker {
-    bool shellcode_initialized{false};
     detail::shellcode<13> shellcode{{0x49, 0x89, 0xCA, 0x48, 0xC7, 0xC0, 0x3F, 0x10, 0x00, 0x00, 0x0F, 0x05, 0xC3}};
+    alignas(std::atomic_ref<std::uint32_t>::required_alignment) std::uint32_t shellcode_state_{0U};
+
+    shellcode_syscall_invoker() = default;
+    shellcode_syscall_invoker(const shellcode_syscall_invoker&) = delete;
+    shellcode_syscall_invoker(shellcode_syscall_invoker&& other) noexcept
+      : shellcode(std::move(other.shellcode)),
+        shellcode_state_(std::atomic_ref<std::uint32_t>{other.shellcode_state_}.exchange(0U, std::memory_order_acq_rel)) {}
+    shellcode_syscall_invoker& operator=(const shellcode_syscall_invoker&) = delete;
+    shellcode_syscall_invoker& operator=(shellcode_syscall_invoker&& other) noexcept {
+      if (this == &other) {
+        return *this;
+      }
+
+      shellcode = std::move(other.shellcode);
+      const auto moved_state = std::atomic_ref<std::uint32_t>{other.shellcode_state_}.exchange(shellcode_state_uninitialized,
+        std::memory_order_acq_rel);
+      std::atomic_ref<std::uint32_t>{shellcode_state_}.store(moved_state, std::memory_order_relaxed);
+      return *this;
+    }
+    ~shellcode_syscall_invoker() = default;
 
     template <typename T = omni::status, typename... Args>
     T operator()(std::uint32_t syscall_id, Args&&... args) {
-      if (!shellcode_initialized) {
-        shellcode.write<std::uint32_t>(6, syscall_id);
-        shellcode.setup();
-        shellcode_initialized = true;
+      auto shellcode_state = std::atomic_ref<std::uint32_t>{shellcode_state_};
+      if (shellcode_state.load(std::memory_order_acquire) != shellcode_state_initialized) {
+        ensure_shellcode_initialized(shellcode_state, syscall_id);
       }
 
       if constexpr (std::is_void_v<T>) {
         shellcode.execute(std::forward<Args>(args)...);
       } else {
         return shellcode.execute<T>(std::forward<Args>(args)...);
+      }
+    }
+
+   private:
+    constexpr static std::uint32_t shellcode_state_uninitialized = 0U;
+    constexpr static std::uint32_t shellcode_state_initializing = 1U;
+    constexpr static std::uint32_t shellcode_state_initialized = 2U;
+
+    void ensure_shellcode_initialized(std::atomic_ref<std::uint32_t> shellcode_state, std::uint32_t syscall_id) {
+      for (;;) {
+        const auto current_state = shellcode_state.load(std::memory_order_acquire);
+        if (current_state == shellcode_state_initialized) {
+          return;
+        }
+
+        if (current_state != shellcode_state_uninitialized) {
+          continue;
+        }
+
+        auto expected_state = shellcode_state_uninitialized;
+        if (!shellcode_state.compare_exchange_strong(expected_state,
+              shellcode_state_initializing,
+              std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+          continue;
+        }
+
+#ifdef OMNI_HAS_EXCEPTIONS
+        try {
+          shellcode.write<std::uint32_t>(6, syscall_id);
+          shellcode.setup();
+          shellcode_state.store(shellcode_state_initialized, std::memory_order_release);
+        } catch (...) {
+          shellcode_state.store(shellcode_state_uninitialized, std::memory_order_release);
+          throw;
+        }
+#else
+        shellcode.write<std::uint32_t>(6, syscall_id);
+        shellcode.setup();
+        shellcode_state.store(shellcode_state_initialized, std::memory_order_release);
+#endif
+        return;
       }
     }
   };
