@@ -7,6 +7,7 @@
 #include "omni/concepts/concepts.hpp"
 #include "omni/concepts/export_range.hpp"
 #include "omni/error.hpp"
+#include "omni/handle.hpp"
 #include "omni/hash.hpp"
 #include "omni/lazy_import.hpp"
 #include "omni/module.hpp"
