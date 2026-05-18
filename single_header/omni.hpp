@@ -3490,16 +3490,24 @@ namespace omni {
 template <>
 struct std::is_error_code_enum<omni::error> : std::true_type {};
 
-#include <expected>
+#include <memory>
 #include <utility>
 
-#include <string_view>
+#ifdef OMNI_ARCH_X64
+
+#  include <atomic>
+#  include <expected>
+#  include <system_error>
+#  include <type_traits>
+#  include <utility>
+
+#  include <string_view>
 
 namespace omni::detail {
 
   template <auto Fn>
   consteval std::string_view extract_function_name() {
-#if defined(OMNI_COMPILER_CLANG)
+#  if defined(OMNI_COMPILER_CLANG)
     // "... extract_function_name() [Fn = &FunctionNameA]"
     constexpr std::string_view pretty = __PRETTY_FUNCTION__;
 
@@ -3507,7 +3515,7 @@ namespace omni::detail {
     constexpr auto name_start = pretty.rfind('&') + 1;
     constexpr auto name_end = pretty.find(']');
     constexpr auto func_name = pretty.substr(name_start, name_end - name_start);
-#elif defined(OMNI_COMPILER_GCC)
+#  elif defined(OMNI_COMPILER_GCC)
     // "... extract_function_name() [with auto Fn = MessageBoxA; std::string_view = std::basic_string_view<char>]"
     constexpr std::string_view pretty = __PRETTY_FUNCTION__;
 
@@ -3515,7 +3523,7 @@ namespace omni::detail {
     constexpr auto name_start = pretty.find(marker) + marker.size();
     constexpr auto name_end = pretty.find(';');
     constexpr auto func_name = pretty.substr(name_start, name_end - name_start);
-#elif defined(OMNI_COMPILER_MSVC)
+#  elif defined(OMNI_COMPILER_MSVC)
     // "... extract_function_name<int __cdecl A::B::FunctionNameA(int, int*)>(void)"
     constexpr std::string_view sig{__FUNCSIG__};
     constexpr std::string_view marker{"extract_function_name<"};
@@ -3540,81 +3548,14 @@ namespace omni::detail {
     // (it will never be the case with WinAPI functions, but anyway...)
     constexpr std::size_t scope = ident.rfind("::");
     constexpr auto func_name = (scope == std::string_view::npos) ? ident : ident.substr(scope + 2);
-#else
-#  error Unsupported compiler
-#endif
+#  else
+#    error Unsupported compiler
+#  endif
     static_assert(!func_name.empty(), "Failed to extract function name");
     return func_name;
   }
 
 } // namespace omni::detail
-
-#include <iterator>
-#include <string_view>
-
-namespace omni::detail {
-
-  template <std::size_t N>
-  struct fixed_string {
-    char value[N]{};
-
-    consteval explicit(false) fixed_string(const char (&str)[N]) {
-      for (std::size_t i = 0; i < N; ++i) {
-        value[i] = str[i];
-      }
-    }
-
-    [[nodiscard]] constexpr std::string_view view() const {
-      return std::string_view{std::data(value), N - 1};
-    }
-  };
-
-} // namespace omni::detail
-
-#include <concepts>
-#include <cstdint>
-#include <iterator>
-#include <type_traits>
-#include <utility>
-
-namespace omni::detail {
-
-  template <typename T>
-  inline auto normalize_pointer_argument(T&& arg) {
-    using value_type = std::remove_cvref_t<T>;
-
-    if constexpr (std::is_array_v<value_type>) {
-      return std::data(arg);
-    } else {
-      // All credits to @Debounce, huge thanks to him/her!
-      //
-      // Since arguments after the fourth are written on the stack,
-      // the compiler will fill the lower 32 bits from int with null,
-      // and the upper 32 bits will remain undefined.
-      //
-      // Because the syscall handler expects a (void*)-sized pointer
-      // there, this address will be garbage for it, hence AV.
-      // If the argument went 1/2/3/4, the compiler would generate a
-      // write to ecx/edx/r8d/r9d, by x64 convention, writing to the
-      // lower half of a 64-bit register zeroes the upper part too
-      // (i.e. ecx = 0 => rcx = 0), so this problem should only exist
-      // on x64 for arguments after the fourth.
-      // The solution would be on templates to loop through all
-      // arguments and manually cast them to size_t size.
-
-      constexpr auto is_signed_integral = std::signed_integral<value_type>;
-      constexpr auto is_unsigned_integral = std::unsigned_integral<value_type>;
-
-      using unsigned_integral_type = std::conditional_t<is_unsigned_integral, std::uintptr_t, value_type>;
-      using tag_type = std::conditional_t<is_signed_integral, std::intptr_t, unsigned_integral_type>;
-
-      return static_cast<tag_type>(std::forward<T>(arg));
-    }
-  }
-
-} // namespace omni::detail
-
-#ifdef OMNI_HAS_CACHING
 
 #  include <mutex>
 #  include <optional>
@@ -3668,497 +3609,57 @@ namespace omni::detail {
 
 } // namespace omni::detail
 
-#endif
+#  include <concepts>
+#  include <cstdint>
+#  include <iterator>
+#  include <type_traits>
+#  include <utility>
 
-namespace omni {
-
-#ifdef OMNI_HAS_CACHING
-  namespace detail {
-    struct export_cache_key {
-      // Use std::uint64_t as a key to store underlying value type of any hash
-      std::uint64_t export_name;
-      std::uint64_t module_name;
-
-      [[nodiscard]] auto operator<=>(const export_cache_key&) const noexcept = default;
-    };
-
-    struct export_cache_key_hasher {
-      [[nodiscard]] std::size_t operator()(const export_cache_key& key) const noexcept {
-        std::uint64_t value = key.export_name;
-        value ^= std::rotl(key.module_name, 32);
-        value ^= 0x9E3779B97F4A7C15ULL;
-        value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
-        value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
-        value ^= value >> 31U;
-        return static_cast<std::size_t>(value);
-      }
-    };
-
-    inline detail::memory_cache<export_cache_key, omni::named_export, export_cache_key_hasher> exports_cache;
-  } // namespace detail
-#endif
+namespace omni::detail {
 
   template <typename T>
-  class lazy_importer {
-   public:
-    explicit lazy_importer(concepts::hash auto export_name): export_(resolve_module_export(export_name)) {}
-    explicit lazy_importer(default_hash export_name): export_(resolve_module_export(export_name)) {}
+  inline auto normalize_pointer_argument(T&& arg) {
+    using value_type = std::remove_cvref_t<T>;
 
-    template <concepts::hash Hasher>
-    explicit lazy_importer(Hasher export_name, Hasher module_name): export_(resolve_module_export(export_name, module_name)) {}
-    explicit lazy_importer(default_hash export_name, default_hash module_name)
-      : export_(resolve_module_export(export_name, module_name)) {}
+    if constexpr (std::is_array_v<value_type>) {
+      return std::data(arg);
+    } else {
+      // All credits to @Debounce, huge thanks to him/her!
+      //
+      // Since arguments after the fourth are written on the stack,
+      // the compiler will fill the lower 32 bits from int with null,
+      // and the upper 32 bits will remain undefined.
+      //
+      // Because the syscall handler expects a (void*)-sized pointer
+      // there, this address will be garbage for it, hence AV.
+      // If the argument went 1/2/3/4, the compiler would generate a
+      // write to ecx/edx/r8d/r9d, by x64 convention, writing to the
+      // lower half of a 64-bit register zeroes the upper part too
+      // (i.e. ecx = 0 => rcx = 0), so this problem should only exist
+      // on x64 for arguments after the fourth.
+      // The solution would be on templates to loop through all
+      // arguments and manually cast them to size_t size.
 
-    template <typename... Args>
-    std::expected<T, std::error_code> try_invoke(Args&&... args) {
-      if (!export_) {
-        return std::unexpected(export_.error());
-      }
+      constexpr auto is_signed_integral = std::signed_integral<value_type>;
+      constexpr auto is_unsigned_integral = std::unsigned_integral<value_type>;
 
-      if constexpr (std::is_void_v<T>) {
-        std::ignore = export_->address.template invoke<void>(detail::normalize_pointer_argument(std::forward<Args>(args))...);
-        return {};
-      } else {
-        auto result = export_->address.template invoke<T>(detail::normalize_pointer_argument(std::forward<Args>(args))...);
-        return result.value_or(T{});
-      }
+      using unsigned_integral_type = std::conditional_t<is_unsigned_integral, std::uintptr_t, value_type>;
+      using tag_type = std::conditional_t<is_signed_integral, std::intptr_t, unsigned_integral_type>;
+
+      return static_cast<tag_type>(std::forward<T>(arg));
     }
-
-    template <typename... Args>
-    T invoke(Args&&... args) {
-      if constexpr (std::is_void_v<T>) {
-        std::ignore = try_invoke(std::forward<Args>(args)...);
-      } else {
-        return try_invoke(std::forward<Args>(args)...).value_or(T{});
-      }
-    }
-
-    template <typename... Args>
-    T operator()(Args&&... args) {
-      return invoke(std::forward<Args>(args)...);
-    }
-
-    [[nodiscard]] omni::named_export named_export() const noexcept {
-      return export_.value_or(omni::named_export{});
-    }
-
-   private:
-    template <concepts::hash Hasher>
-    static std::expected<omni::named_export, std::error_code> resolve_module_export(Hasher export_name, Hasher module_name) {
-#ifdef OMNI_HAS_CACHING
-      detail::export_cache_key export_cache_key{
-        .export_name = export_name.value(),
-        .module_name = module_name.value(),
-      };
-
-      auto module_export = detail::exports_cache.try_get(export_cache_key);
-      if (!module_export or !module_export->present() or !omni::modules{}.contains(module_export->module_base)) {
-        omni::module module = omni::get_module(module_name);
-        if (!module.present()) {
-          return std::unexpected(omni::error::module_not_loaded);
-        }
-
-        omni::named_export fresh_export = omni::get_export(export_name, module);
-        if (!fresh_export.present()) {
-          return std::unexpected(omni::error::export_not_found);
-        }
-
-        detail::exports_cache.set(export_cache_key, fresh_export);
-        return fresh_export;
-      }
-
-      return *module_export;
-#else
-      omni::module module = omni::get_module(module_name);
-      if (!module.present()) {
-        return std::unexpected(omni::error::module_not_loaded);
-      }
-
-      omni::named_export fresh_export = omni::get_export(export_name, module);
-      if (!fresh_export.present()) {
-        return std::unexpected(omni::error::export_not_found);
-      }
-
-      return fresh_export;
-#endif
-    }
-
-    static std::expected<omni::named_export, std::error_code> resolve_module_export(concepts::hash auto export_name) {
-#ifdef OMNI_HAS_CACHING
-      detail::export_cache_key export_cache_key{.export_name = export_name.value()};
-      auto module_export = detail::exports_cache.try_get(export_cache_key);
-
-      // The export is missing from the cache, or its owning module was
-      // unloaded. If the module is loaded again at a different base, we
-      // refresh the cached export, this adds a fast O(n) loaded-module
-      // check to each export lookup to detect stale cache entries
-      if (!module_export or !module_export->present() or !omni::modules{}.contains(module_export->module_base)) {
-        omni::named_export fresh_export = omni::get_export(export_name);
-        if (!fresh_export.present()) {
-          return std::unexpected(omni::error::export_not_found);
-        }
-
-        detail::exports_cache.set(export_cache_key, fresh_export);
-        return fresh_export;
-      }
-
-      return *module_export;
-#else
-      omni::named_export fresh_export = omni::get_export(export_name);
-      if (!fresh_export.present()) {
-        return std::unexpected(omni::error::export_not_found);
-      }
-
-      return fresh_export;
-#endif
-    }
-
-    std::expected<omni::named_export, std::error_code> export_;
-  };
-
-  template <typename T, typename... Params>
-  class lazy_importer<T (*)(Params...)> : private lazy_importer<T> {
-   public:
-    using lazy_importer<T>::lazy_importer;
-    using lazy_importer<T>::named_export;
-
-    std::expected<T, std::error_code> try_invoke(Params... args) {
-      return lazy_importer<T>::try_invoke(args...);
-    }
-
-    T invoke(Params... args) {
-      return lazy_importer<T>::invoke(args...);
-    }
-
-    T operator()(Params... args) {
-      return lazy_importer<T>::invoke(args...);
-    }
-  };
-
-#if defined(OMNI_ARCH_X86)
-  template <typename T, typename... Params>
-  class lazy_importer<T(__stdcall*)(Params...)> : private lazy_importer<T> {
-   public:
-    using lazy_importer<T>::lazy_importer;
-    using lazy_importer<T>::named_export;
-
-    std::expected<T, std::error_code> try_invoke(Params... args) {
-      return lazy_importer<T>::try_invoke(args...);
-    }
-
-    T invoke(Params... args) {
-      return lazy_importer<T>::invoke(args...);
-    }
-
-    T operator()(Params... args) {
-      return lazy_importer<T>::invoke(args...);
-    }
-  };
-#endif
-
-  template <typename T = void, concepts::hash Hasher, typename... Args>
-  inline T lazy_import(Hasher export_name, Args&&... args) {
-    return lazy_importer<T>{export_name}.invoke(std::forward<Args>(args)...);
   }
 
-  template <typename T = void, typename... Args>
-  inline T lazy_import(default_hash export_name, Args&&... args) {
-    return lazy_import<T, default_hash>(export_name, std::forward<Args>(args)...);
-  }
+} // namespace omni::detail
 
-  template <typename T = void, concepts::hash Hasher, typename... Args>
-  inline T lazy_import(omni::hash_pair<Hasher> export_and_module_names, Args&&... args) {
-    auto [export_name, module_name] = export_and_module_names;
-    return lazy_importer<T>{export_name, module_name}.invoke(std::forward<Args>(args)...);
-  }
-
-  template <typename T = void, typename... Args>
-  inline T lazy_import(omni::hash_pair<> export_and_module_names, Args&&... args) {
-    return lazy_import<T, default_hash>(export_and_module_names, std::forward<Args>(args)...);
-  }
-
-  template <auto Func, concepts::hash Hasher, class... Args>
-  inline auto lazy_import(Args&&... args) {
-    constexpr Hasher func_name{detail::extract_function_name<Func>()};
-    return lazy_importer<decltype(Func)>{func_name}.invoke(std::forward<Args>(args)...);
-  }
-
-  template <auto Func, class... Args>
-  inline auto lazy_import(Args&&... args) {
-    return lazy_import<Func, default_hash>(std::forward<Args>(args)...);
-  }
-
-  template <auto Func, detail::fixed_string ModuleName, concepts::hash Hasher, class... Args>
-  inline auto lazy_import(Args&&... args) {
-    constexpr Hasher func_name{detail::extract_function_name<Func>()};
-    constexpr Hasher module_name{ModuleName.view()};
-    return lazy_importer<decltype(Func)>{func_name, module_name}.invoke(std::forward<Args>(args)...);
-  }
-
-  template <auto Func, detail::fixed_string ModuleName, class... Args>
-  inline auto lazy_import(Args&&... args) {
-    return lazy_import<Func, ModuleName, default_hash>(std::forward<Args>(args)...);
-  }
-
-  template <concepts::function_pointer F, concepts::hash Hasher, class... Args>
-  inline auto lazy_import(Hasher export_name, Args&&... args) {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay,hicpp-no-array-decay)
-    return lazy_importer<F>{export_name}.invoke(std::forward<Args>(args)...);
-  }
-
-  template <concepts::function_pointer F, class... Args>
-  inline auto lazy_import(default_hash export_name, Args&&... args) {
-    return lazy_import<F, default_hash>(export_name, std::forward<Args>(args)...);
-  }
-
-  template <concepts::function_pointer F, concepts::hash Hasher, class... Args>
-  inline auto lazy_import(omni::hash_pair<Hasher> export_and_module_names, Args&&... args) {
-    auto [export_name, module_name] = export_and_module_names;
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay,hicpp-no-array-decay)
-    return lazy_importer<F>{export_name, module_name}.invoke(std::forward<Args>(args)...);
-  }
-
-  template <concepts::function_pointer F, class... Args>
-  inline auto lazy_import(omni::hash_pair<> export_and_module_names, Args&&... args) {
-    return lazy_import<F, default_hash>(export_and_module_names, std::forward<Args>(args)...);
-  }
-
-} // namespace omni
-
-#include <cstdint>
-#include <filesystem>
-
-namespace omni::win {
-
-  struct kernel_system_time {
-    std::uint32_t low_part;
-    std::int32_t high1_time;
-    std::int32_t high2_time;
-  };
-
-  enum nt_product_type {
-    win_nt = 1,
-    lan_man_nt = 2,
-    server = 3
-  };
-
-  enum alternative_arch_type {
-    standart_design,
-    nec98x86,
-    end_alternatives
-  };
-
-  struct xstate_feature {
-    std::uint32_t offset;
-    std::uint32_t size;
-  };
-
-  struct xstate_configuration {
-    // Mask of all enabled features
-    std::uint64_t enabled_features;
-    // Mask of volatile enabled features
-    std::uint64_t enabled_volatile_features;
-    // Total size of the save area for user states
-    std::uint32_t size;
-    // Control Flags
-    union {
-      std::uint32_t control_flags;
-      struct {
-        std::uint32_t optimized_save:1;
-        std::uint32_t compaction_enabled:1;
-        std::uint32_t extended_feature_disable:1;
-      };
-    };
-    // List of features
-    xstate_feature features[64];
-    // Mask of all supervisor features
-    std::uint64_t enabled_supervisor_features;
-    // Mask of features that require start address to be 64 byte aligned
-    std::uint64_t aligned_features;
-    // Total size of the save area for user and supervisor states
-    std::uint32_t all_features_size;
-    // List which holds size of each user and supervisor state supported by CPU
-    std::uint32_t all_features[64];
-    // Mask of all supervisor features that are exposed to user-mode
-    std::uint64_t enabled_user_visible_supervisor_features;
-    // Mask of features that can be disabled via XFD
-    std::uint64_t extended_feature_disable_features;
-    // Total size of the save area for non-large user and supervisor states
-    std::uint32_t all_non_large_feature_size;
-    std::uint32_t spare;
-  };
-
-  union win32_large_integer {
-    struct {
-      std::uint32_t low_part;
-      std::int32_t high_part;
-    };
-    struct {
-      std::uint32_t low_part;
-      std::int32_t high_part;
-    } u;
-    std::uint64_t quad_part;
-  };
-
-  struct kernel_user_shared_data {
-    std::uint32_t tick_count_low_deprecated;
-    std::uint32_t tick_count_multiplier;
-    kernel_system_time interrupt_time;
-    kernel_system_time system_time;
-    kernel_system_time time_zone_bias;
-    std::uint16_t image_number_low;
-    std::uint16_t image_number_high;
-    wchar_t nt_system_root[260];
-    std::uint32_t max_stack_trace_depth;
-    std::uint32_t crypto_exponent;
-    std::uint32_t time_zone_id;
-    std::uint32_t large_page_minimum;
-    std::uint32_t ait_sampling_value;
-    std::uint32_t app_compat_flag;
-    std::uint64_t random_seed_version;
-    std::uint32_t global_validation_runlevel;
-    std::int32_t time_zone_bias_stamp;
-    std::uint32_t nt_build_number;
-    nt_product_type nt_product_type;
-    bool product_type_is_valid;
-    bool reserved0[1];
-    std::uint16_t native_processor_architecture;
-    std::uint32_t nt_major_version;
-    std::uint32_t nt_minor_version;
-    bool processor_features[64];
-    std::uint32_t reserved1;
-    std::uint32_t reserved3;
-    std::uint32_t time_slip;
-    alternative_arch_type alternative_arch;
-    std::uint32_t boot_id;
-    win32_large_integer system_expiration_date;
-    std::uint32_t suite_mask;
-    bool kernel_debugger_enabled;
-    union {
-      std::uint8_t mitigation_policies;
-      struct {
-        std::uint8_t nx_support_policy:2;
-        std::uint8_t seh_validation_policy:2;
-        std::uint8_t cur_dir_devices_skipped_for_modules:2;
-        std::uint8_t reserved:2;
-      };
-    };
-    std::uint16_t cycles_per_yield;
-    std::uint32_t active_console_id;
-    std::uint32_t dismount_count;
-    std::uint32_t com_plus_package;
-    std::uint32_t last_system_rit_event_tick_count;
-    std::uint32_t number_of_physical_pages;
-    bool safe_boot_mode;
-    union {
-      std::uint8_t virtualization_flags;
-      struct {
-        std::uint8_t arch_started_in_el2:1;
-        std::uint8_t qc_sl_is_supported:1;
-      };
-    };
-    std::uint8_t reserved12[2];
-    union {
-      std::uint32_t shared_data_flags;
-      struct {
-        std::uint32_t dbg_error_port_present:1;
-        std::uint32_t dbg_elevation_enabled:1;
-        std::uint32_t dbg_virt_enabled:1;
-        std::uint32_t dbg_installer_detect_enabled:1;
-        std::uint32_t dbg_lkg_enabled:1;
-        std::uint32_t dbg_dyn_processor_enabled:1;
-        std::uint32_t dbg_console_broker_enabled:1;
-        std::uint32_t dbg_secure_boot_enabled:1;
-        std::uint32_t dbg_multi_session_sku:1;
-        std::uint32_t dbg_multi_users_in_session_sku:1;
-        std::uint32_t dbg_state_separation_enabled:1;
-        std::uint32_t spare_bits:21;
-      };
-    };
-    std::uint32_t data_flags_pad[1];
-    std::uint64_t test_ret_instruction;
-    std::int64_t qpc_frequency;
-    std::uint32_t system_call;
-    std::uint32_t reserved2;
-    std::uint64_t full_number_of_physical_pages;
-    std::uint64_t system_call_pad[1];
-    union {
-      kernel_system_time tick_count;
-      std::uint64_t tick_count_quad;
-      struct {
-        std::uint32_t reserved_tick_count_overlay[3];
-        std::uint32_t tick_count_pad[1];
-      };
-    };
-    std::uint32_t cookie;
-    std::uint32_t cookie_pad[1];
-    std::int64_t console_session_foreground_process_id;
-    std::uint64_t time_update_lock;
-    std::uint64_t baseline_system_time_qpc;
-    std::uint64_t baseline_interrupt_time_qpc;
-    std::uint64_t qpc_system_time_increment;
-    std::uint64_t qpc_interrupt_time_increment;
-    std::uint8_t qpc_system_time_increment_shift;
-    std::uint8_t qpc_interrupt_time_increment_shift;
-    std::uint16_t unparked_processor_count;
-    std::uint32_t enclave_feature_mask[4];
-    std::uint32_t telemetry_coverage_round;
-    std::uint16_t user_mode_global_logger[16];
-    std::uint32_t image_file_execution_options;
-    std::uint32_t lang_generation_count;
-    std::uint64_t reserved4;
-    std::uint64_t interrupt_time_bias;
-    std::uint64_t qpc_bias;
-    std::uint32_t active_processor_count;
-    std::uint8_t active_group_count;
-    std::uint8_t reserved9;
-    union {
-      std::uint16_t qpc_data;
-      struct {
-        std::uint8_t qpc_bypass_enabled;
-        std::uint8_t qpc_reserved;
-      };
-    };
-    win32_large_integer time_zone_bias_effective_start;
-    win32_large_integer time_zone_bias_effective_end;
-    xstate_configuration xstate;
-    kernel_system_time feature_configuration_change_stamp;
-    std::uint32_t spare;
-    std::uint64_t user_pointer_auth_mask;
-    xstate_configuration xstate_arm64;
-    std::uint32_t reserved10[210];
-
-    [[nodiscard]] std::filesystem::path system_root(
-      std::filesystem::path::format fmt = std::filesystem::path::auto_format) const {
-      return {nt_system_root, fmt};
-    }
-  };
-
-} // namespace omni::win
-
-namespace omni {
-
-  [[nodiscard]] inline omni::win::kernel_user_shared_data* shared_user_data() noexcept {
-    constexpr static omni::address memory_location{0x7ffe0000};
-    return memory_location.ptr<win::kernel_user_shared_data>();
-  }
-
-} // namespace omni
-
-#include <atomic>
-#include <expected>
-#include <system_error>
-#include <type_traits>
-#include <utility>
-
-#include <array>
-#include <concepts>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <memory>
-#include <type_traits>
-#include <utility>
+#  include <array>
+#  include <concepts>
+#  include <cstddef>
+#  include <cstdint>
+#  include <cstring>
+#  include <memory>
+#  include <type_traits>
+#  include <utility>
 
 namespace omni::detail {
 
@@ -4245,7 +3746,7 @@ namespace omni::detail {
 
 } // namespace omni::detail
 
-#ifdef OMNI_HAS_INLINE_SYSCALL
+#  ifdef OMNI_HAS_INLINE_SYSCALL
 /*
  * Copyright 2018-2020 Justas Masiulis
  *
@@ -4262,17 +3763,17 @@ namespace omni::detail {
  * limitations under the License.
  */
 
-#  include <cstdint>
+#    include <cstdint>
 
-#  ifdef OMNI_HAS_INLINE_SYSCALL
+#    ifdef OMNI_HAS_INLINE_SYSCALL
 
 // NOLINTBEGIN(cppcoreguidelines-init-variables)
 
 namespace omni::detail {
 
   // Disables register keyword deprecation warnings
-#    pragma GCC diagnostic push
-#    pragma GCC diagnostic ignored "-Wregister"
+#      pragma GCC diagnostic push
+#      pragma GCC diagnostic ignored "-Wregister"
 
   // Syscall stubs begin here.
   // They all seem more or less the same and that's true, however
@@ -4665,15 +4166,15 @@ namespace omni::detail {
 
   // clang-format on
 
-#    pragma GCC diagnostic pop
+#      pragma GCC diagnostic pop
 
 } // namespace omni::detail
 
-#  endif // OMNI_HAS_INLINE_SYSCALL
+#    endif // OMNI_HAS_INLINE_SYSCALL
 
 // NOLINTEND(cppcoreguidelines-init-variables)
 
-#endif
+#  endif
 
 namespace omni {
 
@@ -4687,10 +4188,10 @@ namespace omni {
   } // namespace concepts
 
   namespace detail {
-#ifdef OMNI_HAS_CACHING
+#  ifdef OMNI_HAS_CACHING
     // Use std::uint64_t as a key to store underlying value type of any hash
     inline detail::memory_cache<std::uint64_t, std::uint32_t> syscall_id_cache;
-#endif
+#  endif
   } // namespace detail
 
   struct default_syscall_id_parser {
@@ -4774,7 +4275,7 @@ namespace omni {
           continue;
         }
 
-#ifdef OMNI_HAS_EXCEPTIONS
+#  ifdef OMNI_HAS_EXCEPTIONS
         try {
           shellcode.write<std::uint32_t>(6, syscall_id);
           shellcode.setup();
@@ -4783,11 +4284,11 @@ namespace omni {
           shellcode_state.store(shellcode_state_uninitialized, std::memory_order_release);
           throw;
         }
-#else
+#  else
         shellcode.write<std::uint32_t>(6, syscall_id);
         shellcode.setup();
         shellcode_state.store(shellcode_state_initialized, std::memory_order_release);
-#endif
+#  endif
         return;
       }
     }
@@ -4795,7 +4296,7 @@ namespace omni {
 
   static_assert(concepts::syscall_invoker<shellcode_syscall_invoker, omni::status>);
 
-#ifdef OMNI_HAS_INLINE_SYSCALL
+#  ifdef OMNI_HAS_INLINE_SYSCALL
   struct inline_syscall_invoker {
     template <typename T = omni::status, typename... Args>
     T operator()(std::uint32_t syscall_id, Args&&... args) {
@@ -4808,7 +4309,7 @@ namespace omni {
   };
 
   static_assert(concepts::syscall_invoker<inline_syscall_invoker, omni::status>);
-#endif
+#  endif
 
   template <concepts::syscall_id_parser Parser = default_syscall_id_parser,
     concepts::syscall_invoker Invoker = shellcode_syscall_invoker>
@@ -4819,9 +4320,9 @@ namespace omni {
 
   using default_syscaller_options = syscaller_options<default_syscall_id_parser, shellcode_syscall_invoker>;
 
-#ifdef OMNI_HAS_INLINE_SYSCALL
+#  ifdef OMNI_HAS_INLINE_SYSCALL
   using inline_syscaller_options = syscaller_options<default_syscall_id_parser, inline_syscall_invoker>;
-#endif
+#  endif
 
   template <typename T = omni::status, typename Options = default_syscaller_options>
     requires(omni::detail::is_x64)
@@ -4864,12 +4365,12 @@ namespace omni {
 
    private:
     std::expected<std::uint32_t, std::error_code> resolve_syscall_id(concepts::hash auto export_name) {
-#ifdef OMNI_HAS_CACHING
+#  ifdef OMNI_HAS_CACHING
       auto cached_syscall_id = detail::syscall_id_cache.try_get(export_name.value());
       if (cached_syscall_id.has_value()) {
         return cached_syscall_id.value();
       }
-#endif
+#  endif
       omni::named_export named_export = omni::get_export(export_name);
       if (!named_export.present()) {
         return std::unexpected(omni::error::export_not_found);
@@ -4880,9 +4381,9 @@ namespace omni {
         return std::unexpected(parsed_syscall_id.error());
       }
 
-#ifdef OMNI_HAS_CACHING
+#  ifdef OMNI_HAS_CACHING
       detail::syscall_id_cache.set(export_name.value(), *parsed_syscall_id);
-#endif
+#  endif
 
       return *parsed_syscall_id;
     }
@@ -4930,11 +4431,11 @@ namespace omni {
     }
   };
 
-#ifdef OMNI_HAS_INLINE_SYSCALL
+#  ifdef OMNI_HAS_INLINE_SYSCALL
   template <typename T = omni::status>
     requires(omni::detail::is_x64)
   using inline_syscaller = syscaller<T, inline_syscaller_options>;
-#endif
+#  endif
 
   template <typename T = omni::status, concepts::hash Hasher, typename... Args>
     requires(!concepts::function_pointer<T>)
@@ -4969,7 +4470,7 @@ namespace omni {
     return syscall<F, default_hash>(export_name, std::forward<Args>(args)...);
   }
 
-#ifdef OMNI_HAS_INLINE_SYSCALL
+#  ifdef OMNI_HAS_INLINE_SYSCALL
   template <typename T = omni::status, concepts::hash Hasher, typename... Args>
     requires(!concepts::function_pointer<T>)
   inline T inline_syscall(Hasher export_name, Args&&... args) {
@@ -5002,6 +4503,639 @@ namespace omni {
   inline auto inline_syscall(default_hash export_name, Args&&... args) {
     return inline_syscall<F, default_hash>(export_name, std::forward<Args>(args)...);
   }
+#  endif
+
+} // namespace omni
+
+#else
+
+#  include <expected>
+#  include <utility>
+
+#  include <iterator>
+#  include <string_view>
+
+namespace omni::detail {
+
+  template <std::size_t N>
+  struct fixed_string {
+    char value[N]{};
+
+    consteval explicit(false) fixed_string(const char (&str)[N]) {
+      for (std::size_t i = 0; i < N; ++i) {
+        value[i] = str[i];
+      }
+    }
+
+    [[nodiscard]] constexpr std::string_view view() const {
+      return std::string_view{std::data(value), N - 1};
+    }
+  };
+
+} // namespace omni::detail
+
+#  ifdef OMNI_HAS_CACHING
+
+#  endif
+
+namespace omni {
+
+#  ifdef OMNI_HAS_CACHING
+  namespace detail {
+    struct export_cache_key {
+      // Use std::uint64_t as a key to store underlying value type of any hash
+      std::uint64_t export_name;
+      std::uint64_t module_name;
+
+      [[nodiscard]] auto operator<=>(const export_cache_key&) const noexcept = default;
+    };
+
+    struct export_cache_key_hasher {
+      [[nodiscard]] std::size_t operator()(const export_cache_key& key) const noexcept {
+        std::uint64_t value = key.export_name;
+        value ^= std::rotl(key.module_name, 32);
+        value ^= 0x9E3779B97F4A7C15ULL;
+        value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
+        value ^= value >> 31U;
+        return static_cast<std::size_t>(value);
+      }
+    };
+
+    inline detail::memory_cache<export_cache_key, omni::named_export, export_cache_key_hasher> exports_cache;
+  } // namespace detail
+#  endif
+
+  template <typename T>
+  class lazy_importer {
+   public:
+    explicit lazy_importer(concepts::hash auto export_name): export_(resolve_module_export(export_name)) {}
+    explicit lazy_importer(default_hash export_name): export_(resolve_module_export(export_name)) {}
+
+    template <concepts::hash Hasher>
+    explicit lazy_importer(Hasher export_name, Hasher module_name): export_(resolve_module_export(export_name, module_name)) {}
+    explicit lazy_importer(default_hash export_name, default_hash module_name)
+      : export_(resolve_module_export(export_name, module_name)) {}
+
+    template <typename... Args>
+    std::expected<T, std::error_code> try_invoke(Args&&... args) {
+      if (!export_) {
+        return std::unexpected(export_.error());
+      }
+
+      if constexpr (std::is_void_v<T>) {
+        std::ignore = export_->address.template invoke<void>(detail::normalize_pointer_argument(std::forward<Args>(args))...);
+        return {};
+      } else {
+        auto result = export_->address.template invoke<T>(detail::normalize_pointer_argument(std::forward<Args>(args))...);
+        return result.value_or(T{});
+      }
+    }
+
+    template <typename... Args>
+    T invoke(Args&&... args) {
+      if constexpr (std::is_void_v<T>) {
+        std::ignore = try_invoke(std::forward<Args>(args)...);
+      } else {
+        return try_invoke(std::forward<Args>(args)...).value_or(T{});
+      }
+    }
+
+    template <typename... Args>
+    T operator()(Args&&... args) {
+      return invoke(std::forward<Args>(args)...);
+    }
+
+    [[nodiscard]] omni::named_export named_export() const noexcept {
+      return export_.value_or(omni::named_export{});
+    }
+
+   private:
+    template <concepts::hash Hasher>
+    static std::expected<omni::named_export, std::error_code> resolve_module_export(Hasher export_name, Hasher module_name) {
+#  ifdef OMNI_HAS_CACHING
+      detail::export_cache_key export_cache_key{
+        .export_name = export_name.value(),
+        .module_name = module_name.value(),
+      };
+
+      auto module_export = detail::exports_cache.try_get(export_cache_key);
+      if (!module_export or !module_export->present() or !omni::modules{}.contains(module_export->module_base)) {
+        omni::module module = omni::get_module(module_name);
+        if (!module.present()) {
+          return std::unexpected(omni::error::module_not_loaded);
+        }
+
+        omni::named_export fresh_export = omni::get_export(export_name, module);
+        if (!fresh_export.present()) {
+          return std::unexpected(omni::error::export_not_found);
+        }
+
+        detail::exports_cache.set(export_cache_key, fresh_export);
+        return fresh_export;
+      }
+
+      return *module_export;
+#  else
+      omni::module module = omni::get_module(module_name);
+      if (!module.present()) {
+        return std::unexpected(omni::error::module_not_loaded);
+      }
+
+      omni::named_export fresh_export = omni::get_export(export_name, module);
+      if (!fresh_export.present()) {
+        return std::unexpected(omni::error::export_not_found);
+      }
+
+      return fresh_export;
+#  endif
+    }
+
+    static std::expected<omni::named_export, std::error_code> resolve_module_export(concepts::hash auto export_name) {
+#  ifdef OMNI_HAS_CACHING
+      detail::export_cache_key export_cache_key{.export_name = export_name.value()};
+      auto module_export = detail::exports_cache.try_get(export_cache_key);
+
+      // The export is missing from the cache, or its owning module was
+      // unloaded. If the module is loaded again at a different base, we
+      // refresh the cached export, this adds a fast O(n) loaded-module
+      // check to each export lookup to detect stale cache entries
+      if (!module_export or !module_export->present() or !omni::modules{}.contains(module_export->module_base)) {
+        omni::named_export fresh_export = omni::get_export(export_name);
+        if (!fresh_export.present()) {
+          return std::unexpected(omni::error::export_not_found);
+        }
+
+        detail::exports_cache.set(export_cache_key, fresh_export);
+        return fresh_export;
+      }
+
+      return *module_export;
+#  else
+      omni::named_export fresh_export = omni::get_export(export_name);
+      if (!fresh_export.present()) {
+        return std::unexpected(omni::error::export_not_found);
+      }
+
+      return fresh_export;
+#  endif
+    }
+
+    std::expected<omni::named_export, std::error_code> export_;
+  };
+
+  template <typename T, typename... Params>
+  class lazy_importer<T (*)(Params...)> : private lazy_importer<T> {
+   public:
+    using lazy_importer<T>::lazy_importer;
+    using lazy_importer<T>::named_export;
+
+    std::expected<T, std::error_code> try_invoke(Params... args) {
+      return lazy_importer<T>::try_invoke(args...);
+    }
+
+    T invoke(Params... args) {
+      return lazy_importer<T>::invoke(args...);
+    }
+
+    T operator()(Params... args) {
+      return lazy_importer<T>::invoke(args...);
+    }
+  };
+
+#  if defined(OMNI_ARCH_X86)
+  template <typename T, typename... Params>
+  class lazy_importer<T(__stdcall*)(Params...)> : private lazy_importer<T> {
+   public:
+    using lazy_importer<T>::lazy_importer;
+    using lazy_importer<T>::named_export;
+
+    std::expected<T, std::error_code> try_invoke(Params... args) {
+      return lazy_importer<T>::try_invoke(args...);
+    }
+
+    T invoke(Params... args) {
+      return lazy_importer<T>::invoke(args...);
+    }
+
+    T operator()(Params... args) {
+      return lazy_importer<T>::invoke(args...);
+    }
+  };
+#  endif
+
+  template <typename T = void, concepts::hash Hasher, typename... Args>
+  inline T lazy_import(Hasher export_name, Args&&... args) {
+    return lazy_importer<T>{export_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <typename T = void, typename... Args>
+  inline T lazy_import(default_hash export_name, Args&&... args) {
+    return lazy_import<T, default_hash>(export_name, std::forward<Args>(args)...);
+  }
+
+  template <typename T = void, concepts::hash Hasher, typename... Args>
+  inline T lazy_import(omni::hash_pair<Hasher> export_and_module_names, Args&&... args) {
+    auto [export_name, module_name] = export_and_module_names;
+    return lazy_importer<T>{export_name, module_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <typename T = void, typename... Args>
+  inline T lazy_import(omni::hash_pair<> export_and_module_names, Args&&... args) {
+    return lazy_import<T, default_hash>(export_and_module_names, std::forward<Args>(args)...);
+  }
+
+  template <auto Func, concepts::hash Hasher, class... Args>
+  inline auto lazy_import(Args&&... args) {
+    constexpr Hasher func_name{detail::extract_function_name<Func>()};
+    return lazy_importer<decltype(Func)>{func_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <auto Func, class... Args>
+  inline auto lazy_import(Args&&... args) {
+    return lazy_import<Func, default_hash>(std::forward<Args>(args)...);
+  }
+
+  template <auto Func, detail::fixed_string ModuleName, concepts::hash Hasher, class... Args>
+  inline auto lazy_import(Args&&... args) {
+    constexpr Hasher func_name{detail::extract_function_name<Func>()};
+    constexpr Hasher module_name{ModuleName.view()};
+    return lazy_importer<decltype(Func)>{func_name, module_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <auto Func, detail::fixed_string ModuleName, class... Args>
+  inline auto lazy_import(Args&&... args) {
+    return lazy_import<Func, ModuleName, default_hash>(std::forward<Args>(args)...);
+  }
+
+  template <concepts::function_pointer F, concepts::hash Hasher, class... Args>
+  inline auto lazy_import(Hasher export_name, Args&&... args) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay,hicpp-no-array-decay)
+    return lazy_importer<F>{export_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <concepts::function_pointer F, class... Args>
+  inline auto lazy_import(default_hash export_name, Args&&... args) {
+    return lazy_import<F, default_hash>(export_name, std::forward<Args>(args)...);
+  }
+
+  template <concepts::function_pointer F, concepts::hash Hasher, class... Args>
+  inline auto lazy_import(omni::hash_pair<Hasher> export_and_module_names, Args&&... args) {
+    auto [export_name, module_name] = export_and_module_names;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay,hicpp-no-array-decay)
+    return lazy_importer<F>{export_name, module_name}.invoke(std::forward<Args>(args)...);
+  }
+
+  template <concepts::function_pointer F, class... Args>
+  inline auto lazy_import(omni::hash_pair<> export_and_module_names, Args&&... args) {
+    return lazy_import<F, default_hash>(export_and_module_names, std::forward<Args>(args)...);
+  }
+
+} // namespace omni
+
 #endif
+
+namespace omni {
+
+  using native_handle = void*;
+
+  namespace detail {
+    class nt_close_invoker {
+     public:
+      [[nodiscard]] omni::status operator()(native_handle handle) {
+        return invoker_.try_invoke(handle).value_or(ntstatus::procedure_not_found);
+      }
+
+     private:
+#ifdef OMNI_ARCH_X64
+#  ifdef OMNI_HAS_INLINE_SYSCALL
+      omni::inline_syscaller<omni::status> invoker_{"NtClose"};
+#  else
+      omni::syscaller<omni::status> invoker_{"NtClose"};
+#  endif
+#else
+      omni::lazy_importer<omni::status> invoker_{"NtClose", "ntdll.dll"};
+#endif
+    };
+
+    inline omni::status nt_close(native_handle handle) noexcept {
+#ifdef OMNI_HAS_EXCEPTIONS
+      try {
+#endif
+        static nt_close_invoker nt_close_sc;
+        return nt_close_sc(handle);
+#ifdef OMNI_HAS_EXCEPTIONS
+      } catch (const std::bad_alloc&) {
+        return omni::ntstatus::no_memory;
+      } catch (...) {
+        return omni::ntstatus::unsuccessful;
+      }
+#endif
+    }
+  } // namespace detail
+
+  class unique_handle {
+   public:
+    using handle_type = native_handle;
+
+    unique_handle() noexcept = default;
+    explicit unique_handle(handle_type handle) noexcept: handle_(handle) {}
+
+    unique_handle(const unique_handle&) = delete;
+    unique_handle(unique_handle&& other) noexcept: handle_(other.release()) {}
+
+    unique_handle& operator=(const unique_handle&) = delete;
+    unique_handle& operator=(unique_handle&& other) noexcept {
+      if (this != std::addressof(other)) {
+        reset(other.release());
+      }
+
+      return *this;
+    }
+
+    ~unique_handle() noexcept {
+      reset();
+    }
+
+    [[nodiscard]] handle_type get() const noexcept {
+      return handle_;
+    }
+
+    [[nodiscard]] handle_type* out_ptr() noexcept {
+      reset();
+      return std::addressof(handle_);
+    }
+
+    [[nodiscard]] handle_type release() noexcept {
+      return std::exchange(handle_, nullptr);
+    }
+
+    void reset(handle_type handle = nullptr) noexcept {
+      if (handle_ == handle) {
+        return;
+      }
+
+      const handle_type previous = std::exchange(handle_, handle);
+      if (is_valid(previous)) {
+        omni::detail::nt_close(previous);
+      }
+    }
+
+    [[nodiscard]] omni::status close() noexcept {
+      if (!valid()) {
+        return omni::ntstatus::success;
+      }
+
+      const omni::status result = omni::detail::nt_close(handle_);
+      if (result == omni::ntstatus::success) {
+        handle_ = nullptr;
+      }
+
+      return result;
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+      return is_valid(handle_);
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+      return valid();
+    }
+
+    void swap(unique_handle& other) noexcept {
+      std::swap(handle_, other.handle_);
+    }
+
+   private:
+    [[nodiscard]] static bool is_valid(const handle_type handle) noexcept {
+      return handle != nullptr && handle != reinterpret_cast<handle_type>(-1);
+    }
+
+    handle_type handle_{};
+  };
+
+  inline void swap(unique_handle& left, unique_handle& right) noexcept {
+    left.swap(right);
+  }
+
+} // namespace omni
+
+#include <cstdint>
+#include <filesystem>
+
+namespace omni::win {
+
+  struct kernel_system_time {
+    std::uint32_t low_part;
+    std::int32_t high1_time;
+    std::int32_t high2_time;
+  };
+
+  enum nt_product_type {
+    win_nt = 1,
+    lan_man_nt = 2,
+    server = 3
+  };
+
+  enum alternative_arch_type {
+    standart_design,
+    nec98x86,
+    end_alternatives
+  };
+
+  struct xstate_feature {
+    std::uint32_t offset;
+    std::uint32_t size;
+  };
+
+  struct xstate_configuration {
+    // Mask of all enabled features
+    std::uint64_t enabled_features;
+    // Mask of volatile enabled features
+    std::uint64_t enabled_volatile_features;
+    // Total size of the save area for user states
+    std::uint32_t size;
+    // Control Flags
+    union {
+      std::uint32_t control_flags;
+      struct {
+        std::uint32_t optimized_save:1;
+        std::uint32_t compaction_enabled:1;
+        std::uint32_t extended_feature_disable:1;
+      };
+    };
+    // List of features
+    xstate_feature features[64];
+    // Mask of all supervisor features
+    std::uint64_t enabled_supervisor_features;
+    // Mask of features that require start address to be 64 byte aligned
+    std::uint64_t aligned_features;
+    // Total size of the save area for user and supervisor states
+    std::uint32_t all_features_size;
+    // List which holds size of each user and supervisor state supported by CPU
+    std::uint32_t all_features[64];
+    // Mask of all supervisor features that are exposed to user-mode
+    std::uint64_t enabled_user_visible_supervisor_features;
+    // Mask of features that can be disabled via XFD
+    std::uint64_t extended_feature_disable_features;
+    // Total size of the save area for non-large user and supervisor states
+    std::uint32_t all_non_large_feature_size;
+    std::uint32_t spare;
+  };
+
+  union win32_large_integer {
+    struct {
+      std::uint32_t low_part;
+      std::int32_t high_part;
+    };
+    struct {
+      std::uint32_t low_part;
+      std::int32_t high_part;
+    } u;
+    std::uint64_t quad_part;
+  };
+
+  struct kernel_user_shared_data {
+    std::uint32_t tick_count_low_deprecated;
+    std::uint32_t tick_count_multiplier;
+    kernel_system_time interrupt_time;
+    kernel_system_time system_time;
+    kernel_system_time time_zone_bias;
+    std::uint16_t image_number_low;
+    std::uint16_t image_number_high;
+    wchar_t nt_system_root[260];
+    std::uint32_t max_stack_trace_depth;
+    std::uint32_t crypto_exponent;
+    std::uint32_t time_zone_id;
+    std::uint32_t large_page_minimum;
+    std::uint32_t ait_sampling_value;
+    std::uint32_t app_compat_flag;
+    std::uint64_t random_seed_version;
+    std::uint32_t global_validation_runlevel;
+    std::int32_t time_zone_bias_stamp;
+    std::uint32_t nt_build_number;
+    nt_product_type nt_product_type;
+    bool product_type_is_valid;
+    bool reserved0[1];
+    std::uint16_t native_processor_architecture;
+    std::uint32_t nt_major_version;
+    std::uint32_t nt_minor_version;
+    bool processor_features[64];
+    std::uint32_t reserved1;
+    std::uint32_t reserved3;
+    std::uint32_t time_slip;
+    alternative_arch_type alternative_arch;
+    std::uint32_t boot_id;
+    win32_large_integer system_expiration_date;
+    std::uint32_t suite_mask;
+    bool kernel_debugger_enabled;
+    union {
+      std::uint8_t mitigation_policies;
+      struct {
+        std::uint8_t nx_support_policy:2;
+        std::uint8_t seh_validation_policy:2;
+        std::uint8_t cur_dir_devices_skipped_for_modules:2;
+        std::uint8_t reserved:2;
+      };
+    };
+    std::uint16_t cycles_per_yield;
+    std::uint32_t active_console_id;
+    std::uint32_t dismount_count;
+    std::uint32_t com_plus_package;
+    std::uint32_t last_system_rit_event_tick_count;
+    std::uint32_t number_of_physical_pages;
+    bool safe_boot_mode;
+    union {
+      std::uint8_t virtualization_flags;
+      struct {
+        std::uint8_t arch_started_in_el2:1;
+        std::uint8_t qc_sl_is_supported:1;
+      };
+    };
+    std::uint8_t reserved12[2];
+    union {
+      std::uint32_t shared_data_flags;
+      struct {
+        std::uint32_t dbg_error_port_present:1;
+        std::uint32_t dbg_elevation_enabled:1;
+        std::uint32_t dbg_virt_enabled:1;
+        std::uint32_t dbg_installer_detect_enabled:1;
+        std::uint32_t dbg_lkg_enabled:1;
+        std::uint32_t dbg_dyn_processor_enabled:1;
+        std::uint32_t dbg_console_broker_enabled:1;
+        std::uint32_t dbg_secure_boot_enabled:1;
+        std::uint32_t dbg_multi_session_sku:1;
+        std::uint32_t dbg_multi_users_in_session_sku:1;
+        std::uint32_t dbg_state_separation_enabled:1;
+        std::uint32_t spare_bits:21;
+      };
+    };
+    std::uint32_t data_flags_pad[1];
+    std::uint64_t test_ret_instruction;
+    std::int64_t qpc_frequency;
+    std::uint32_t system_call;
+    std::uint32_t reserved2;
+    std::uint64_t full_number_of_physical_pages;
+    std::uint64_t system_call_pad[1];
+    union {
+      kernel_system_time tick_count;
+      std::uint64_t tick_count_quad;
+      struct {
+        std::uint32_t reserved_tick_count_overlay[3];
+        std::uint32_t tick_count_pad[1];
+      };
+    };
+    std::uint32_t cookie;
+    std::uint32_t cookie_pad[1];
+    std::int64_t console_session_foreground_process_id;
+    std::uint64_t time_update_lock;
+    std::uint64_t baseline_system_time_qpc;
+    std::uint64_t baseline_interrupt_time_qpc;
+    std::uint64_t qpc_system_time_increment;
+    std::uint64_t qpc_interrupt_time_increment;
+    std::uint8_t qpc_system_time_increment_shift;
+    std::uint8_t qpc_interrupt_time_increment_shift;
+    std::uint16_t unparked_processor_count;
+    std::uint32_t enclave_feature_mask[4];
+    std::uint32_t telemetry_coverage_round;
+    std::uint16_t user_mode_global_logger[16];
+    std::uint32_t image_file_execution_options;
+    std::uint32_t lang_generation_count;
+    std::uint64_t reserved4;
+    std::uint64_t interrupt_time_bias;
+    std::uint64_t qpc_bias;
+    std::uint32_t active_processor_count;
+    std::uint8_t active_group_count;
+    std::uint8_t reserved9;
+    union {
+      std::uint16_t qpc_data;
+      struct {
+        std::uint8_t qpc_bypass_enabled;
+        std::uint8_t qpc_reserved;
+      };
+    };
+    win32_large_integer time_zone_bias_effective_start;
+    win32_large_integer time_zone_bias_effective_end;
+    xstate_configuration xstate;
+    kernel_system_time feature_configuration_change_stamp;
+    std::uint32_t spare;
+    std::uint64_t user_pointer_auth_mask;
+    xstate_configuration xstate_arm64;
+    std::uint32_t reserved10[210];
+
+    [[nodiscard]] std::filesystem::path system_root(
+      std::filesystem::path::format fmt = std::filesystem::path::auto_format) const {
+      return {nt_system_root, fmt};
+    }
+  };
+
+} // namespace omni::win
+
+namespace omni {
+
+  [[nodiscard]] inline omni::win::kernel_user_shared_data* shared_user_data() noexcept {
+    constexpr static omni::address memory_location{0x7ffe0000};
+    return memory_location.ptr<win::kernel_user_shared_data>();
+  }
 
 } // namespace omni
