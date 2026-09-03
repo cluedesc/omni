@@ -2,6 +2,17 @@
 #include "test_utils.hpp"
 
 ut::suite<"omni::detail::shellcode"> shellcode_suite = [] {
+  "read and write preserve multi-byte values at unaligned offsets"_test = [] {
+    constexpr std::uint32_t expected{0x12345678U};
+    omni::detail::shellcode<8> shellcode{{0xAA, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x00, 0x00}};
+
+    shellcode.write<std::uint32_t>(1, expected);
+
+    expect(shellcode.read<std::uint32_t>(1) == expected);
+    expect(shellcode.read(0) == 0xAA);
+    expect(shellcode.read(5) == 0xBB);
+  };
+
   "move construction transfers executable buffer ownership"_test = [] {
     omni::detail::shellcode<1> source{{0xC3}};
     source.setup();

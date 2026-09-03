@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -48,12 +49,24 @@ namespace omni::detail {
 
     template <std::integral T = std::uint8_t>
     [[nodiscard]] T read(std::size_t index) const noexcept {
-      return shellcode_[index];
+      if (index > shellcode_.size() || sizeof(T) > shellcode_.size() - index) {
+        assert(false);
+        return T{};
+      }
+
+      T value{};
+      std::memcpy(std::addressof(value), shellcode_.data() + index, sizeof(value));
+      return value;
     }
 
     template <std::integral T>
     void write(std::size_t index, T value) noexcept {
-      *reinterpret_cast<T*>(&shellcode_[index]) = value;
+      if (index > shellcode_.size() || sizeof(T) > shellcode_.size() - index) {
+        assert(false);
+        return;
+      }
+
+      std::memcpy(shellcode_.data() + index, std::addressof(value), sizeof(value));
     }
 
     template <typename T, typename... Args>
